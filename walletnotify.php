@@ -1,6 +1,6 @@
 <?php
 /*
-   bitcoin.conf:
+   groestlcoin.conf:
      walletnotify=/usr/bin/php -f /srv/app/bin/walletnotify.php %s
 
 SQLLite
@@ -9,7 +9,7 @@ CREATE TABLE "walletnotify"
 (
 
  `rowid` integer PRIMARY KEY NOT NULL,
- "txid" varchar(100) NOT NULL  UNIQUE ,
+ "txid" varchar(100) NOT NULL,
  "tot_amt" NUMERIC, "tot_fee" NUMERIC,
  "confirmations" INTEGER,
  "comment" varchar(50),
@@ -19,7 +19,9 @@ CREATE TABLE "walletnotify"
  "category" varchar(20),
  "amount" NUMERIC,
  "fee" NUMERIC,
- "last_update" VARCHAR DEFAULT CURRENT_TIMESTAMP
+ "vout" NUMERIC,
+ "last_update" VARCHAR DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE (txid, vout)
 );
 
 CREATE  INDEX "main"."idx_walletnotify_txid" ON "walletnotify" ("txid" ASC);
@@ -49,14 +51,16 @@ CREATE TABLE `walletnotify` (
    `category` varchar(50) DEFAULT NULL,
    `amount` decimal(14,8) DEFAULT NULL,
    `fee` decimal(14,8) DEFAULT NULL,
+   `vout` int(11) DEFAULT NULL,
    `last_update` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00' ON UPDATE CURRENT_TIMESTAMP,
    PRIMARY KEY (`rowid`),
-   UNIQUE KEY `txid` (`txid`),
+   KEY `txid` (`txid`),
    KEY `confirmations` (`confirmations`),
    KEY `comment` (`comment`),
    KEY `account` (`account`),
    KEY `address` (`address`),
-   KEY `last_update` (`last_update`)
+   KEY `last_update` (`last_update`),
+   CONSTRAINT txid_vout UNIQUE (`txid`, `vout`)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8;
 
  */
@@ -67,17 +71,20 @@ CREATE TABLE `walletnotify` (
 
    define('WN_GLOBAL_TIMESTAMP', time());
 
-   //- set for local bitcoind access or remote RPC service like rpc.blockchain.info
+   //- set for local groestlcoind access
    define('WN_RPC_USER', '');
    define('WN_RPC_PASS', '');
    define('WN_RPC_HOST', '');
    define('WN_RPC_PORT', '');
 
+   //- Trigger file
+   define('TRIGGERS_FILE','triggers.txt');
+
    //- Email to send notifications to
    define('WN_EMAIL_ADMIN', '');
 
    //- Email address notifications should come from
-   define('WN_EMAIL_FROM', 'WN.BTC.Bot <walletnotify.bot@domain.com>');
+   define('WN_EMAIL_FROM', 'WN.GRS.Bot <walletnotify.bot@domain.com>');
 
    //- Email to SMS gateway of mobile carrier like:
    //- #@vtext.com, #@txt.att.net, etc.
@@ -98,6 +105,16 @@ CREATE TABLE `walletnotify` (
 
    //- END DB SELECT
 
+   //- TRIGGERS
+   //- one trigger per line. Trigger format:
+   //- category|address|signed-tx|
+   //- remember the "|" in the end of the line. category can be 'receive' or 'send' without 's.
+   //- address is the interesting address which triggers the trigger
+   if (file_exists(TRIGGERS_FILE))
+      $triggers = file(TRIGGERS_FILE);
+   else
+      $triggers = false;
+
    //- END CONFIGS
 
    if(2 == $argc)    {
@@ -106,7 +123,7 @@ CREATE TABLE `walletnotify` (
       $helper = new Helper($db, $api);
 
       $walletinfo = $api->getinfo();
-      $txninfo = $api->gettransaction($argv[1]);
+      $txninfo = $api->gettransaction($argv[1], true); //supports watch-only addresses too
 
       error_log('=== WALLETNOTIFY ===');
       error_log('walletinfo: '. print_r($walletinfo,true));
@@ -116,14 +133,15 @@ CREATE TABLE `walletnotify` (
 
          $sql =  "REPLACE INTO walletnotify ".
                      "(`txid`, `tot_amt`, `tot_fee`, `confirmations`, `comment`, `blocktime`, ".
-                     "`address`, `account`, `category`, `amount`, `fee`, `last_update`) ".
+                     "`address`, `account`, `category`, `amount`, `fee`, `vout`, `last_update`) ".
                      "VALUES ".
                      "(:txid, :tot_amt, :tot_fee, :confirmations, :comment, :blocktime, ".
-                     ":address, :account, :category, :amount, :fee, NOW())";
+                     ":address, :account, :category, :amount, :fee, :vout, NOW())";
 
          $qry = $db->prepare($sql);
 
          foreach($txninfo['details'] as $id => $details) {
+            if ($details['account']=="") continue;
             $vars = array(
                            'txid'     => $txninfo['txid'],
                            'tot_amt'  => $txninfo['amount'],
@@ -135,9 +153,25 @@ CREATE TABLE `walletnotify` (
                            'address'  => $details['address'],
                            'category' => $details['category'],
                            'amount'   => $details['amount'],
-                           'fee'      => $details['fee']
+                           'fee'      => $details['fee'],
+                           'vout'     => $details['vout']
                            );
-            if(!$txnhead)   $txnhead = $vars;
+
+            //- Check triggers
+            if ($triggers!==false) {
+               foreach ($triggers as $trigger_key => $trigger_val) {
+                 $trigger = explode("|",$trigger_val);
+                 if (($trigger[1]==$details['address']) && ($trigger[0]==$details['category'])) {
+                   exec('groestlcoin-cli sendrawtransaction '.$trigger[2]);
+                    //after this, delete this trigger
+                    unset($triggers[$trigger_key]);
+                    file_put_contents(TRIGGERS_FILE, implode("\n",array_map('trim',$triggers))); 
+                 }
+               }
+            }
+
+            //- send notifications
+            Helper::walletnotify_email($vars);
 
             foreach($vars as $key => $val)  {
                $qry->bindValue(':'.$key, $val);
@@ -154,8 +188,6 @@ CREATE TABLE `walletnotify` (
          error_log('sql: '. print_r($sql,true));
       }
 
-      //- send notifications
-      Helper::walletnotify_email($txnhead);
    }
 
    error_log('=== END WALLETNOTIFY ===');
@@ -170,10 +202,10 @@ CREATE TABLE `walletnotify` (
 
 
 /*
-EasyBitcoin-PHP
+EasyGroestlcoin-PHP
 
-A simple class for making calls to Bitcoin's API using PHP.
-https://github.com/aceat64/EasyBitcoin-PHP
+A simple class for making calls to Groestlcoin's API using PHP.
+https://github.com/groestlcoin/EasyGroestlcoin-PHP
 
 ====================
 
@@ -201,39 +233,39 @@ THE SOFTWARE.
 
 ====================
 
-// Initialize Bitcoin connection/object
-$bitcoin = new Bitcoin('username','password');
+// Initialize Groestlcoin connection/object
+$groestlcoin = new Groestlcoin('username','password');
 
 // Optionally, you can specify a host and port.
-$bitcoin = new Bitcoin('username','password','host','port');
+$groestlcoin = new Groestlcoin('username','password','host','port');
 // Defaults are:
 //  host = localhost
-//  port = 8332
+//  port = 1441
 //  proto = http
 
 // If you wish to make an SSL connection you can set an optional CA certificate or leave blank
 // This will set the protocol to HTTPS and some CURL flags
-$bitcoin->setSSL('/full/path/to/mycertificate.cert');
+$groestlcoin->setSSL('/full/path/to/mycertificate.cert');
 
-// Make calls to bitcoind as methods for your object. Responses are returned as an array.
+// Make calls to groestlcoind as methods for your object. Responses are returned as an array.
 // Examples:
-$bitcoin->getinfo();
-$bitcoin->getrawtransaction('0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098',1);
-$bitcoin->getblock('000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f');
+$groestlcoin->getinfo();
+$groestlcoin->getrawtransaction('cf72b5842b3528fd7f3065ba9e93c50a62e84f42b3b7b7a351d910b5e353b662',1);
+$groestlcoin->getblock('00000000000071568fb10377ec1ef76bf3ec9585205512c9c4244fab6ee97fde');
 
 // The full response (not usually needed) is stored in $this->response while the raw JSON is stored in $this->raw_response
 
 // When a call fails for any reason, it will return FALSE and put the error message in $this->error
 // Example:
-echo $bitcoin->error;
+echo $groestlcoin->error;
 
 // The HTTP status code can be found in $this->status and will either be a valid HTTP status code or will be 0 if cURL was unable to connect.
 // Example:
-echo $bitcoin->status;
+echo $groestlcoin->status;
 
 */
 
-class Bitcoin
+class Groestlcoin
 {
    // Configuration options
    private $username;
@@ -260,7 +292,7 @@ class Bitcoin
     * @param string $proto
     * @param string $url
     */
-   function __construct($username, $password, $host = 'localhost', $port = 8332, $url = null) {
+   function __construct($username, $password, $host = 'localhost', $port = 1441, $url = null) {
          $this->username      = $username;
          $this->password      = $password;
          $this->host          = $host;
@@ -343,11 +375,11 @@ class Bitcoin
          }
 
          if ($this->response['error']) {
-               // If bitcoind returned an error, put that in $this->error
+               // If groestlcoind returned an error, put that in $this->error
                $this->error = $this->response['error']['message'];
          }
          elseif ($this->status != 200) {
-               // If bitcoind didn't return a nice error message, we need to make our own
+               // If groestlcoind didn't return a nice error message, we need to make our own
                switch ($this->status) {
                      case 400:
                            $this->error = 'HTTP_BAD_REQUEST';
@@ -452,10 +484,10 @@ class TransRef
 
 /*
 
-   CoindRPC - JsonRPC Class to talk to bitcoind
+   CoindRPC - JsonRPC Class to talk to groestlcoind
 
  */
-class CoindRPC extends Bitcoin
+class CoindRPC extends Groestlcoin
 {
 
    public function __construct()
@@ -498,7 +530,7 @@ class CoindRPC extends Bitcoin
             $address_info = $this->validateaddress($address);
 
             if($address_info['isvalid'] == 1 && $address_info['ismine'] == 1)   {
-               //- if only listening to one BTC account
+               //- if only listening to one GRS account
                //$history = $this->listtransactions(WN_RPC_ACCT);
                $history = $this->listtransactions();
 
@@ -590,9 +622,9 @@ class Helper
 
    public static function walletnotify_email($txnhead)
    {
-      //- bitcoind calls walletnotify on 0 confirmations and 1.
+      //- groestlcoind calls walletnotify on 0 confirmations and 1.
       //- We only want email to go out on the first call. Otherwise
-      //- if we want only one 1 confrime, change this to 
+      //- if we want only one 1 confrime, change this to
       //- confirmations == 0) return;
       if($txnhead['confirmations'] > 0)   return;
 
